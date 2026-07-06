@@ -3,10 +3,13 @@ use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::thread;
 
-use log::{info, debug};
+use log::{info, debug, warn};
 
 const MAX_DCMI_PROCS: usize = 64;
 const DCMI_UPDATE_INTERVAL_SECS: u64 = 5;
+/// How often the lightweight reaper runs. It makes NO DCMI call, so dead slots are cleared
+/// promptly even when the DCMI refresh thread stalls on a blocking in-container query.
+const REAP_INTERVAL_SECS: u64 = 2;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,8 +45,40 @@ fn discover_npu_devices() -> Vec<(i32, i32)> {
         .collect()
 }
 
-/// Standalone DCMI update — reads hardware process memory and writes to shmem.
-/// Runs in a dedicated thread, independent of the scheduling run loop.
+/// Reap dead process slots and release their memory. Runs on its own fast cadence (see
+/// REAP_INTERVAL_SECS) so an abnormal exit (crash/kill-9/OOM/zombie) is reflected within
+/// one interval, regardless of the app's allocations.
+///
+/// Only SUBTRACTS the dead slot's own bytes — it never re-derives the whole counter from
+/// the slots, which would clobber the worker-maintained `memory_used` of live processes.
+fn reap_dead_slots(local: &LocalContainerShmem) {
+    for slot in &local.procs {
+        let pid = slot.pid.load(Ordering::Relaxed);
+        if pid == 0 || proc_alive(pid) {
+            continue;
+        }
+        if slot
+            .pid
+            .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            continue;
+        }
+        let mut leaked = 0u64;
+        for d in 0..NPU_DEVICE_MAX {
+            leaked += slot.hbm_used[d].swap(0, Ordering::AcqRel);
+        }
+        slot.is_active.store(0, Ordering::Release);
+        let _ = local.memory_used.fetch_update(Ordering::SeqCst, Ordering::Acquire, |cur| {
+            Some(cur.saturating_sub(leaked))
+        });
+        debug!("[Reap] cleared dead slot pid={} released {} MB", pid, leaked / 1024 / 1024);
+    }
+}
+
+/// DCMI hardware refresh of LIVE slots (per device). In its own thread because the
+/// in-container `dcmi_get_device_resource_info` can block indefinitely; isolating it means
+/// such a stall only delays hardware correction, never the reaper above.
 fn discover_and_update(local: &LocalContainerShmem) {
     let devices = discover_npu_devices();
     for (idx, &(card_id, device_id)) in devices.iter().enumerate() {
@@ -65,24 +100,23 @@ fn discover_and_update(local: &LocalContainerShmem) {
             .collect();
         let dev = idx % NPU_DEVICE_MAX;
         for slot in &local.procs {
-            let host_pid = slot.host_pid.load(Ordering::Relaxed);
-            if host_pid == 0 {
+            let pid = slot.pid.load(Ordering::Relaxed);
+            if pid == 0 {
                 continue;
             }
-            if let Some(&mem) = dcmimap.get(&host_pid) {
+            // ascend runtime reports CONTAINER PIDs here (== slot.pid = std::process::id()).
+            // Bare docker w/o ascend runtime reports HOST PIDs and won't match — memory then
+            // stays at the rtMalloc-hook value, which is the correct per-pod allocation anyway.
+            if let Some(&mem) = dcmimap.get(&pid) {
                 slot.hbm_used[dev].store(mem, Ordering::Release);
             }
         }
     }
-    let mut total: u64 = 0;
-    for slot in &local.procs {
-        total += slot.hbm_used[0].load(Ordering::Acquire);
-    }
-    local.memory_used.store(total, Ordering::Release);
 }
 
 use crate::shmem::{GlobalRegistry, LocalContainerShmem, futex, MAX_MANAGERS, NPU_DEVICE_MAX, STATE_IDLE, STATE_RUNNING, STATE_MEASURING, MAX_WORKERS};
 use crate::config::ManagerConfig;
+use crate::worker::proc_alive;
 
 const GLOBAL_WATCHDOG_TIMEOUT_US: u64 = 1_000_000;
 const GLOBAL_WAIT_POLL_US: u64 = 1_000;
@@ -111,7 +145,6 @@ struct SharePlan {
 pub struct ContainerManager {
     global: &'static GlobalRegistry,
     local: &'static LocalContainerShmem,
-    #[allow(dead_code)]
     my_pid: i32,
     my_global_idx: usize,
     current_avg_us: u64,
@@ -123,8 +156,8 @@ pub struct ContainerManager {
 }
 
 impl ContainerManager {
-    pub fn new(global: &'static GlobalRegistry, local: &'static LocalContainerShmem, pid: i32, config: ManagerConfig) -> Self {   
-        let idx = Self::register_global_slot(global, pid);
+    pub fn new(global: &'static GlobalRegistry, local: &'static LocalContainerShmem, pid: i32, config: ManagerConfig) -> Option<Self> {
+        let idx = Self::register_global_slot(global, pid)?;
 
         // TODO: Refactor
         let token_scale = std::env::var("NPU_TOKEN_SCALE").unwrap_or_else(|_| "100.0".to_string()).parse::<f64>().unwrap_or(1.0).max(0.1);
@@ -148,12 +181,15 @@ impl ContainerManager {
 
         let memory_limit_bytes = memory_limit * MB_TO_BYTES;
 
-        // Initialize
         local.memory_limit.store(memory_limit_bytes, Ordering::Relaxed);
-        local.memory_used.store(0, Ordering::Relaxed);
+        if local.initialized.load(Ordering::Acquire) == 0 {
+            local.memory_used.store(0, Ordering::Relaxed);
+        }
         local.compute_priority.store(comp_priority as u64, Ordering::Relaxed);
+        local.manager_global_idx.store(idx as i32, Ordering::Release);
+        local.initialized.store(1, Ordering::Release);
 
-        Self {
+        Some(Self {
             global,
             local,
             my_pid: pid,
@@ -164,10 +200,10 @@ impl ContainerManager {
             ema_alpha,
             fixed_share_ratio,
             next_run_not_before: None,
-        }
+        })
     }
 
-    fn register_global_slot(global: &'static GlobalRegistry, pid: i32) -> usize {
+    fn register_global_slot(global: &'static GlobalRegistry, pid: i32) -> Option<usize> {
         for (i, slot) in global.slots.iter().enumerate() {
             if slot
                 .is_active
@@ -177,15 +213,23 @@ impl ContainerManager {
                 slot.pid.store(pid, Ordering::Relaxed);
                 slot.avg_kernel_time.store(DEFAULT_AVG_US, Ordering::Relaxed);
                 slot.last_heartbeat.store(get_time_us(), Ordering::Relaxed);
-                return i;
+                return Some(i);
             }
         }
 
-        panic!("Global registry full. Increase MAX_MANAGERS.");
+        warn!("Global registry full ({} managers); cannot register, staying worker-only.", MAX_MANAGERS);
+        None
     }
 
     pub fn run(&mut self) {
-        // Spawn a dedicated thread for DCMI updates, independent of the scheduling loop
+        let reap_shmem = self.local;
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(REAP_INTERVAL_SECS));
+                reap_dead_slots(reap_shmem);
+            }
+        });
+
         let local_shmem = self.local;
         thread::spawn(move || {
             loop {
@@ -551,8 +595,11 @@ impl ContainerManager {
     }
     
     fn update_heartbeat(&self) {
-        self.global.lock_timestamp.store(get_time_us(), Ordering::Relaxed);
-        self.global.slots[self.my_global_idx].last_heartbeat.store(get_time_us(), Ordering::Relaxed);
+        let now = get_time_us();
+        self.global.lock_timestamp.store(now, Ordering::Relaxed);
+        self.global.slots[self.my_global_idx].last_heartbeat.store(now, Ordering::Relaxed);
+        // Local heartbeat so a same-pod supervisor can detect this manager dying.
+        self.local.manager_heartbeat.store(now, Ordering::Relaxed);
     }
 }
 
@@ -560,6 +607,14 @@ impl Drop for ContainerManager {
     fn drop(&mut self) {
         // Mark this manager inactive so others will skip its slot and can steal the lock.
         self.global.slots[self.my_global_idx].is_active.store(0, Ordering::Relaxed);
+
+        // Release local manager ownership so a same-pod supervisor can take over.
+        // Best-effort: run() is an infinite loop and kill -9 skips Drop, so real recovery
+        // relies on the supervisor's proc_alive + heartbeat-timeout checks, not this.
+        let _ = self.local.manager_pid.compare_exchange(
+            self.my_pid, 0, Ordering::AcqRel, Ordering::Relaxed,
+        );
+        self.local.manager_global_idx.store(-1, Ordering::Release);
 
         // Nudge waiters so they re-check ownership promptly (even if we held the lock).
         self.global.signal_counter.fetch_add(1, Ordering::Release);

@@ -59,11 +59,19 @@ pub struct LocalWorkerReport {
 #[repr(C)]
 #[derive(Debug)]
 pub struct ProcessSlot {
-    pub pid: AtomicI32,          // container PID, 0 = free
-    pub host_pid: AtomicI32,     // host PID from /proc/self/status NSpid
-    pub hbm_used: [AtomicU64; NPU_DEVICE_MAX],
-    pub is_active: AtomicU32,    // 1 = registered
+    pub pid: AtomicI32,                        // container PID; 0 = free
+    pub hbm_used: [AtomicU64; NPU_DEVICE_MAX], // per-device HBM bytes; 4B pad precedes (host_pid removed)
+    pub is_active: AtomicU32,                  // 1 = registered
 }
+
+// The device-plugin monitor reads ProcessSlot by hardcoded byte offsets; lock the layout
+// so a field change fails the build here instead of corrupting its readings.
+const _: () = {
+    assert!(std::mem::size_of::<ProcessSlot>() == 80);
+    assert!(std::mem::offset_of!(ProcessSlot, pid) == 0);
+    assert!(std::mem::offset_of!(ProcessSlot, hbm_used) == 8);
+    assert!(std::mem::offset_of!(ProcessSlot, is_active) == 72);
+};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -83,4 +91,9 @@ pub struct LocalContainerShmem {
     pub reports: [LocalWorkerReport; MAX_WORKERS],
 
     pub procs: [ProcessSlot; MAX_PROCESSES],
+
+    pub manager_pid: AtomicI32,        // elected manager's container PID; 0 = none
+    pub manager_heartbeat: AtomicU64,  // manager heartbeat (us); stale => eligible for takeover
+    pub manager_global_idx: AtomicI32, // global slot the manager holds (for takeover reclaim)
+    pub initialized: AtomicU32,        // 1 once manager published limit/priority; workers wait on it
 }
