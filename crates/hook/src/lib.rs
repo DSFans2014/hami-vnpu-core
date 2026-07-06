@@ -1,12 +1,48 @@
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
 
 use limiter::worker::SchedulerClient;
+
+/// PID that already started a supervisor thread — one per process, re-armed after fork.
+static SUPERVISOR_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Lazily start this process's manager supervisor on the first intercepted NPU call.
+/// NOT started from the ctor: `ld.so.preload` loads libvnpu into every process (incl. the
+/// short-lived TBE-compiler subprocesses CANN/torch spawn), and a supervisor in each made
+/// them all thrash the single manager role. Gating on "actually used the NPU" excludes them.
+/// Only spawns a thread (returns immediately) to stay off the dynamic-linker load lock.
+fn ensure_supervisor() {
+    let me = std::process::id() as i32;
+    let cur = SUPERVISOR_PID.load(Ordering::Acquire);
+    if cur == me {
+        return;
+    }
+    if SUPERVISOR_PID
+        .compare_exchange(cur, me, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        let spawned = std::panic::catch_unwind(|| {
+            std::thread::Builder::new()
+                .name("vnpu-supervisor".into())
+                .spawn(|| {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        limiter::supervisor::run,
+                    ));
+                })
+        });
+        if !matches!(spawned, Ok(Ok(_))) {
+            let _ = SUPERVISOR_PID.compare_exchange(me, cur, Ordering::AcqRel, Ordering::Relaxed);
+            log::warn!("[hook] failed to spawn vnpu-supervisor thread; will retry on next NPU call");
+        }
+    }
+}
 
 /// PID-aware factory: detects fork and creates a fresh SchedulerClient for the child.
 /// Falls back to a no-op stub if shmem is not available (e.g. in TBE compiler subprocesses).
 static LIMITER: Mutex<Option<(i32, SchedulerClient)>> = Mutex::new(None);
 
 pub fn npu_limiter() -> SchedulerClient {
+    ensure_supervisor();
     let pid = std::process::id() as i32;
     let mut guard = LIMITER.lock().unwrap();
     if let Some((old_pid, ref client)) = *guard {

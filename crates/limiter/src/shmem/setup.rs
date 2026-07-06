@@ -5,7 +5,9 @@ use std::path::Path;
 
 use libc::{open, close, ftruncate, fstat, mmap, O_RDWR, O_CREAT, PROT_READ, PROT_WRITE, MAP_SHARED, MAP_FAILED, off_t, c_uint};
 
-use crate::shmem::GlobalRegistry;
+use std::sync::atomic::Ordering;
+
+use crate::shmem::{GlobalRegistry, MAX_MANAGERS};
 
 /// Create a file-backed shared memory region.
 /// `path` is a full filesystem path; parent directories are created if missing.
@@ -98,9 +100,7 @@ pub fn open_global_registry(path: &str) -> &'static GlobalRegistry {
     let reg = unsafe { &*(ptr as *const GlobalRegistry) };
 
     if needs_init {
-        // TODO
-        // 这里手动调用初始化逻辑，比如把锁所有权设为某个无效值
-        // (reg as *mut GlobalRegistry).initialize_fields();
+        reg.lock_owner.store(MAX_MANAGERS as u32, Ordering::Relaxed);
     }
     println!("connect to global registry");
     reg

@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant, Duration};
 use std::thread;
 use std::fmt;
 use std::collections::HashMap;
@@ -12,6 +12,19 @@ use crate::shmem::{self, LocalContainerShmem, futex, MAX_WORKERS, STATE_IDLE, ST
 use crate::config::{local_shmem_path, VIRTUAL_OVERHEAD_MB};
 use crate::externed_api::*;
 use crate::check_rts;
+
+/// Max time a worker waits for the manager to create + initialize shmem before
+/// giving up. On timeout SchedulerClient::new panics and npu_limiter() falls back
+/// to a no-op stub, so a worker never hangs forever when no manager is elected.
+const SHMEM_WAIT_TIMEOUT_SECS: u64 = 10;
+
+/// Atomically subtract `v` from `a`, saturating at 0 (never wraps to ~2^64 on an
+/// accounting slip). Returns true if it hit the floor, so the caller can heal.
+fn atomic_saturating_sub(a: &std::sync::atomic::AtomicU64, v: u64) -> bool {
+    a.fetch_update(Ordering::SeqCst, Ordering::Acquire, |cur| Some(cur.saturating_sub(v)))
+        .map(|prev| prev < v)
+        .unwrap_or(false)
+}
 
 #[derive(Debug)]
 struct InnerLock {
@@ -38,6 +51,9 @@ struct SchedulerClientInner {
     device_id: usize,
     lock: Mutex<InnerLock>,
     hbm_handle_map: Mutex<HashMap<u64, u64>>,
+    /// True for the no-op stub (no shmem / no manager). All limit checks are
+    /// short-circuited so the worker never blocks on the state futex.
+    is_stub: bool,
 }
 
 impl fmt::Debug for SchedulerClientInner {
@@ -57,10 +73,18 @@ impl SchedulerClient {
         info!("[Worker PID:{}] Initialize SchedulerClient...", my_pid);
 
         let shmem_path = local_shmem_path();
-        // Wait for manager daemon to create the shmem file (it may start concurrently)
+        let deadline = Instant::now() + Duration::from_secs(SHMEM_WAIT_TIMEOUT_SECS);
         let shmem = loop {
             if let Some(s) = shmem::setup::try_open_shmem::<LocalContainerShmem>(shmem_path.as_str()) {
-                break s;
+                if s.initialized.load(Ordering::Acquire) == 1 {
+                    break s;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "[Worker PID:{}] timed out after {}s waiting for manager to initialize shmem",
+                    my_pid, SHMEM_WAIT_TIMEOUT_SECS
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         };
@@ -88,6 +112,7 @@ impl SchedulerClient {
                 device_id,
                 lock: Mutex::new(inner_lock),
                 hbm_handle_map: Mutex::new(HashMap::new()),
+                is_stub: false,
             }),
         }
     }
@@ -127,7 +152,17 @@ impl SchedulerClient {
     }
 
     fn register_proc_slot(shmem: &'static LocalContainerShmem, pid: i32) -> usize {
-        let host_pid = read_host_pid(pid);
+        for (i, slot) in shmem.procs.iter().enumerate() {
+            if slot.is_active.load(Ordering::Acquire) == 1
+                && slot.pid.load(Ordering::Acquire) == pid
+            {
+                for dev in 0..shmem::NPU_DEVICE_MAX {
+                    slot.hbm_used[dev].store(0, Ordering::Relaxed);
+                }
+                return i;
+            }
+        }
+
         for (i, slot) in shmem.procs.iter().enumerate() {
             if slot
                 .is_active
@@ -135,7 +170,19 @@ impl SchedulerClient {
                 .is_ok()
             {
                 slot.pid.store(pid, Ordering::Relaxed);
-                slot.host_pid.store(host_pid, Ordering::Relaxed);
+                for dev in 0..shmem::NPU_DEVICE_MAX {
+                    slot.hbm_used[dev].store(0, Ordering::Relaxed);
+                }
+                return i;
+            }
+            let spid = slot.pid.load(Ordering::Acquire);
+            if spid != 0
+                && !proc_alive(spid)
+                && slot
+                    .pid
+                    .compare_exchange(spid, pid, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+            {
                 for dev in 0..shmem::NPU_DEVICE_MAX {
                     slot.hbm_used[dev].store(0, Ordering::Relaxed);
                 }
@@ -173,6 +220,10 @@ impl SchedulerClient {
 impl SchedulerClient {
     /// The Main Entry Point
     pub fn wait_for_token(&self, user_stream: u64) {
+        if self.inner.is_stub {
+            return;
+        }
+
         // We lock the mutex to safely access/modify internal state.
         // NOTE: In high contention, this serializes access to this check.
         let mut lock = self.inner.lock.lock().unwrap();
@@ -319,6 +370,9 @@ impl SchedulerClient {
 // Limit HBM
 impl SchedulerClient {
     pub fn check_memory_quota(&self, size: u64) -> u64 {
+        if self.inner.is_stub {
+            return 0;
+        }
         let shmem = self.inner.shmem;
         let limit = shmem.memory_limit.load(Ordering::Relaxed);
 
@@ -373,7 +427,10 @@ impl SchedulerClient {
             let slot = &self.inner.shmem.procs[self.inner.my_proc_idx];
             slot.hbm_used[dev].fetch_add(size, Ordering::Release);
         } else {
-            self.inner.shmem.memory_used.fetch_sub(size, Ordering::SeqCst);
+            if atomic_saturating_sub(&self.inner.shmem.memory_used, size) {
+                warn!("[Worker PID:{}] memory_used underflow on alloc-rollback; re-deriving from live slots", std::process::id());
+                let _ = self.recalculate_usage();
+            }
         }
     }
 
@@ -385,10 +442,14 @@ impl SchedulerClient {
             };
 
             if size > 0 {
-                self.inner.shmem.memory_used.fetch_sub(size, Ordering::SeqCst);
                 let dev = self.current_device();
                 let slot = &self.inner.shmem.procs[self.inner.my_proc_idx];
-                slot.hbm_used[dev].fetch_sub(size, Ordering::Release);
+                let slot_underflow = atomic_saturating_sub(&slot.hbm_used[dev], size);
+                let global_underflow = atomic_saturating_sub(&self.inner.shmem.memory_used, size);
+                if slot_underflow || global_underflow {
+                    warn!("[Worker PID:{}] memory_used underflow on free; re-deriving from live slots", std::process::id());
+                    let _ = self.recalculate_usage();
+                }
                 debug!(
                     "[Limiter] Free Success: Handle 0x{:x}, Size {} bytes returned to quota.",
                     handle, size
@@ -440,7 +501,7 @@ impl SchedulerClient {
                 "[Limiter] Cleaned {} bytes from dead processes, correcting memory_used",
                 cleaned
             );
-            shmem.memory_used.fetch_sub(cleaned, Ordering::Release);
+            atomic_saturating_sub(&shmem.memory_used, cleaned);
         }
 
         // Correct global counter to match slot sum
@@ -450,7 +511,7 @@ impl SchedulerClient {
             shmem.memory_used.fetch_add(add, Ordering::Release);
         } else if total < current {
             let sub = current - total;
-            shmem.memory_used.fetch_sub(sub, Ordering::Release);
+            atomic_saturating_sub(&shmem.memory_used, sub);
         }
 
         total
@@ -511,6 +572,7 @@ impl SchedulerClient {
                     start_time_us: 0,
                 }),
                 hbm_handle_map: Mutex::new(HashMap::new()),
+                is_stub: true,
             }),
         }
     }
@@ -521,7 +583,7 @@ impl SchedulerClient {
     }
 }
 
-fn proc_alive(pid: i32) -> bool {
+pub(crate) fn proc_alive(pid: i32) -> bool {
     match fs::read_to_string(format!("/proc/{}/stat", pid)) {
         Ok(stat) => {
             // Extract the process state character (3rd field, after pid and comm)
@@ -535,27 +597,6 @@ fn proc_alive(pid: i32) -> bool {
             true // If we can't parse, assume alive
         }
         Err(_) => false, // /proc/pid/stat doesn't exist → process is dead
-    }
-}
-
-/// Read the host PID from /proc/self/status NSpid field.
-/// Falls back to container PID if NSpid is not available.
-fn read_host_pid(container_pid: i32) -> i32 {
-    match fs::read_to_string("/proc/self/status") {
-        Ok(status) => {
-            for line in status.lines() {
-                if line.starts_with("NSpid:") {
-                    // Format: "NSpid:\t10\t33538" — last field is host PID
-                    if let Some(last) = line.split_whitespace().last() {
-                        if let Ok(host_pid) = last.parse::<i32>() {
-                            return host_pid;
-                        }
-                    }
-                }
-            }
-            container_pid
-        }
-        Err(_) => container_pid,
     }
 }
 
